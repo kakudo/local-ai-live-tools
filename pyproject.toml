@@ -1,0 +1,15 @@
+[project]
+name = "ollama-visio-explain"
+version = "0.1.0"
+description = "Ollama vision explanation application that captures active window screenshots"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=10.0.0", # Image processing
+    "requests>=2.31.0", # HTTP requests to Ollama
+    "pygetwindow>=0.0.9", # Window management
+    "pyautogui>=0.9.54", # Screenshot capture
+    "openai-whisper>=20250625",
+    "pyaudio>=0.2.14",
+    "numpy>=1.21.0",
+]

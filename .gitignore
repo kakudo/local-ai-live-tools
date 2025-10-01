@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# project-specific ignores
+comment.xml
+*.md
+*.txt
+*.json
+*.yml
+*.yaml
+*.log
+*.csv
+images/
+!prompt.md
+!voice_readme.md
+test_*
