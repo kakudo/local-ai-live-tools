@@ -57,6 +57,30 @@ class OllamaVisionExplainer:
         if self.enable_voice:
             self.init_voice_recognition()
     
+    def remove_character_count(self, comment):
+        """
+        コメント末尾の文字数カウント表示を除去する
+        
+        Args:
+            comment: str 処理対象のコメント
+            
+        Returns:
+            str: 文字数カウント部分を除去したコメント
+        """
+        import re
+        
+        if not comment:
+            return comment
+            
+        # 半角括弧パターン: (〇〇文字)
+        comment = re.sub(r'\([0-9０-９]+文字\)$', '', comment)
+        
+        # 全角括弧パターン: （〇〇文字）
+        comment = re.sub(r'（[0-9０-９]+文字）$', '', comment)
+        
+        # 前後の空白を除去
+        return comment.strip()
+
     def load_prompt(self):
         """
         プロンプトファイルを読み込む
@@ -816,8 +840,11 @@ class OllamaVisionExplainer:
             comment = comment_item["comment"]
             persona = comment_item["persona"]
             
+            # コメント末尾の文字数カウント表示を除去
+            comment_cleaned = self.remove_character_count(comment)
+            
             # XMLコメント要素を作成
-            comment_xml = f'  <comment no="0" time="{unix_time}" owner="0" service="youtubelive" handle="{handle}">{comment}</comment>'
+            comment_xml = f'  <comment no="0" time="{unix_time}" owner="0" service="youtubelive" handle="{handle}">{comment_cleaned}</comment>'
             
             # ファイルを読み込み
             with open(self.xml_file, 'r', encoding='utf-8') as f:
@@ -833,7 +860,10 @@ class OllamaVisionExplainer:
             # カウンターをインクリメント
             self.comment_counter += 1
             
-            print(f"[XML] XML出力: {persona} - {comment}")
+            # 文字数カウント除去前後で異なる場合のみ情報を表示
+            if comment != comment_cleaned:
+                print(f"[XML] 文字数カウント除去: '{comment}' → '{comment_cleaned}'")
+            print(f"[XML] XML出力: {persona} - {comment_cleaned}")
             
         except Exception as e:
             print(f"XML書き込みエラー: {e}")
