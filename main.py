@@ -17,7 +17,7 @@ from voice import RealTimeVoiceRecognizer
 COMMENT_PATH = "C:\\MultiCommentViewer\\CommentGenerator0.0.8b\\anzen-live-helper\\public\\comment.xml"
 
 class OllamaVisionExplainer:
-    def __init__(self, ollama_url="http://localhost:11434", model_name="gemma3:12b", comment_model_name="deepseek-r1:8b", xml_file=COMMENT_PATH, prompt_file="prompt.md", enable_voice=True, debug_mode=False):
+    def __init__(self, ollama_url="http://localhost:11434", model_name="gemma3:12b", comment_model_name="deepseek-r1:8b", xml_file=COMMENT_PATH, prompt_file="prompt.md", enable_voice=True, debug_mode=False, resize_width=800, resize_height=600, resize_quality=85):
         """
         Ollama Vision Explainer
         
@@ -29,6 +29,9 @@ class OllamaVisionExplainer:
             prompt_file: プロンプトファイルのパス (デフォルト: prompt.md)
             enable_voice: 音声認識を有効にするかどうか (デフォルト: True)
             debug_mode: 画面解析デバッグモードを有効にするかどうか (デフォルト: False)
+            resize_width: リサイズ後の幅 (デフォルト: 800)
+            resize_height: リサイズ後の高さ (デフォルト: 600)
+            resize_quality: JPEG品質 (1-100, デフォルト: 85)
         """
         self.ollama_url = ollama_url
         self.model_name = model_name
@@ -39,6 +42,11 @@ class OllamaVisionExplainer:
         self.comment_counter = 0
         self.prompt_content = self.load_prompt()
         self.debug_mode = debug_mode
+        
+        # 画像リサイズ設定
+        self.resize_width = resize_width
+        self.resize_height = resize_height
+        self.resize_quality = resize_quality
         
         # デバッグログファイル
         self.debug_log_file = "screen_analysis_debug.log" if debug_mode else None
@@ -80,6 +88,35 @@ class OllamaVisionExplainer:
         
         # 前後の空白を除去
         return comment.strip()
+
+    def resize_image(self, image):
+        """
+        画像をリサイズして処理速度を向上させる
+        
+        Args:
+            image: PIL.Image オリジナル画像
+            
+        Returns:
+            PIL.Image: リサイズ済み画像
+        """
+        try:
+            original_size = image.size
+            
+            # アスペクト比を維持してリサイズ
+            image.thumbnail((self.resize_width, self.resize_height), Image.Resampling.LANCZOS)
+            
+            resized_size = image.size
+            
+            # デバッグモードの場合、リサイズ情報を表示
+            if self.debug_mode:
+                compression_ratio = (original_size[0] * original_size[1]) / (resized_size[0] * resized_size[1])
+                print(f"[画像リサイズ] {original_size} → {resized_size} (圧縮率: {compression_ratio:.2f}x)")
+            
+            return image
+            
+        except Exception as e:
+            print(f"画像リサイズエラー: {e}")
+            return image
 
     def load_prompt(self):
         """
@@ -216,7 +253,7 @@ class OllamaVisionExplainer:
     
     def image_to_base64(self, image):
         """
-        PIL画像をBase64エンコードされた文字列に変換
+        PIL画像をリサイズしてBase64エンコードされた文字列に変換
         
         Args:
             image: PIL.Image オブジェクト
@@ -225,9 +262,27 @@ class OllamaVisionExplainer:
             str: Base64エンコードされた画像データ
         """
         try:
+            # 元のサイズを記録
+            original_size = image.size
+            
+            # 画像をリサイズ
+            resized_image = self.resize_image(image.copy())
+            
+            # RGBAの場合はRGBに変換（JPEG保存のため）
+            if resized_image.mode == 'RGBA':
+                rgb_image = Image.new('RGB', resized_image.size, (255, 255, 255))
+                rgb_image.paste(resized_image, mask=resized_image.split()[-1])
+                resized_image = rgb_image
+            
             buffer = io.BytesIO()
-            image.save(buffer, format='PNG')
+            resized_image.save(buffer, format='JPEG', quality=self.resize_quality, optimize=True)
             buffer.seek(0)
+            
+            # ファイルサイズ情報を表示
+            file_size_kb = len(buffer.getvalue()) / 1024
+            if self.debug_mode:
+                print(f"[画像圧縮] 品質: {self.resize_quality}, サイズ: {file_size_kb:.1f}KB")
+            
             image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
             return image_base64
         except Exception as e:
@@ -1004,17 +1059,23 @@ def main():
         debug_mode = "--debug" in sys.argv or "-d" in sys.argv
         
         # アプリケーションを初期化
+        # 🎛️ 画像リサイズ設定（処理速度向上のため）
+        # - resize_width/height: 大きいほど高解像度だが処理が重い (推奨: 600-1200)
+        # - resize_quality: JPEG品質 1-100 (推奨: 70-90)
         explainer = OllamaVisionExplainer(
             model_name="gemma3:12b",  # 1段階目：画像解析用
             comment_model_name="gemma3:12b",  # 2段階目：コメント生成用（一時的に同じモデル）
-            debug_mode=debug_mode
+            debug_mode=debug_mode,
+            resize_width=640,      # ⚡ 幅: 小さくすると高速化 (デフォルト: 640)
+            resize_height=360,     # ⚡ 高さ: 小さくすると高速化 (デフォルト: 360) 
+            resize_quality=75      # ⚡ 品質: 低いと高速化・ファイルサイズ削減 (デフォルト: 75)
         )
         
         if debug_mode:
             print("[Debug] デバッグモードが有効です。画面解析の詳細情報が表示されます。")
         
         # 継続的な解析を開始（5秒間隔）
-        explainer.run_continuous_analysis(interval=1)
+        explainer.run_continuous_analysis(interval=0.1)
         
     except Exception as e:
         print(f"アプリケーション起動エラー: {e}")

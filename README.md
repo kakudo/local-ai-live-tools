@@ -7,7 +7,7 @@
 
 1. **Ollama** がローカルで起動していること
 2. **Vision対応モデル** がOllamaにインストールされていること
-3. **MultiCommentViewer** (コメント表示用、オプション)
+3. **NiCommentGeneratorなど** (コメント表示用) 読み込むcomment.xmlのパスを本ツールのXML出力先にする
 
 ### Ollamaのセットアップ
 
@@ -123,9 +123,9 @@ python voice.py --device cpu
 
 ```python
 # Ollamaの設定
-OLLAMA_URL = "http://localhost:11434"  # OllamaサーバーのURL
-IMAGE_MODEL = "gemma3:12b"  # 画像解析用モデル（段階1）
-COMMENT_MODEL = "gemma3:12b"  # コメント生成用モデル（段階2）
+OLLAMA_URL = "http://localhost:11434"  # OllamaサーバーのURL。外部に用意できるのであればその方が良い
+IMAGE_MODEL = "gemma3:12b"  # 画像解析用モデル（段階1）。Vision読み取り必須
+COMMENT_MODEL = "gemma3:12b"  # コメント生成用モデル（段階2）。文章のみでOKだがgemma3でも可
 
 # 実行間隔の設定
 INTERVAL = 1  # 1秒間隔でスクリーンショット取得
@@ -142,8 +142,8 @@ COMMENT_OUTPUT_FILE = "comment.xml"  # 出力ファイル名
 1. **Ollamaサーバーを起動**（必須）
 2. **メインシステムを実行**: `python main.py`
 3. **任意のゲームをアクティブにする**（ブラウザ、Steam、エミュレータなど）
-4. **1秒ごとに11人のAIコメンターがリアルタイム反応**
-5. **オプション**: `python voice.py` で音声認識も同時実行
+4. **OBSでNiCommentGeneratorのHTMLを要素に加える**
+5. **11人のAIコメンターがリアルタイム反応**
 
 ### 実際の出力例
 
@@ -168,4 +168,3 @@ COMMENT_OUTPUT_FILE = "comment.xml"  # 出力ファイル名
 - **Ollamaサーバー**: 必ず起動している必要があります（接続エラー時はエラーメッセージ表示）
 - **処理時間**: 2段階処理により高品質だが、やや処理時間が必要
 - **MultiCommentViewer連携**: `comment.xml`ファイルを監視することでコメントビューアーに表示可能
-- **音声認識**: オプション機能として別プロセスで実行可能
