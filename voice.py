@@ -20,7 +20,7 @@ import torch
 class RealTimeVoiceRecognizer:
     """リアルタイム音声認識クラス"""
     
-    def __init__(self, model_name: str = "base", device: Optional[str] = None):
+    def __init__(self, model_name: str = "medium", device: Optional[str] = None):
         """
         初期化
         
@@ -32,7 +32,12 @@ class RealTimeVoiceRecognizer:
         
         # デバイスの自動選択
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            cuda_available = torch.cuda.is_available()
+            device = "cuda" if cuda_available else "cpu"
+            print(f"デバイス自動選択: CUDA利用可能={cuda_available}")
+            if cuda_available:
+                print(f"GPU: {torch.cuda.get_device_name(0)}")
+                print(f"GPUメモリ: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
         
         self.device = device
         self.model = whisper.load_model(model_name, device=device)
@@ -54,6 +59,10 @@ class RealTimeVoiceRecognizer:
         # 制御フラグ
         self.is_recording = False
         self.is_processing = False
+        
+        # 音声認識結果を蓄積するリスト
+        self.recognized_texts = []
+        self.text_lock = threading.Lock()
         
         print(f"音声設定: {self.sample_rate}Hz, {self.chunk_duration}秒チャンク")
     
@@ -133,6 +142,7 @@ class RealTimeVoiceRecognizer:
             
             # 無音チェック（閾値以下は処理しない）
             if np.abs(audio_data).mean() < 0.001:
+                # print("audio_data is silent, skipping transcription.")
                 return ""
             
             # Whisperで音声認識
@@ -167,10 +177,18 @@ class RealTimeVoiceRecognizer:
                     # 文字起こし実行
                     text = self.process_audio_chunk(process_data)
                     
-                    # 結果表示
+                    # 結果表示と蓄積
                     if text:
                         timestamp = time.strftime("%H:%M:%S")
                         print(f"[{timestamp}] {text}")
+                        
+                        # 認識結果をリストに蓄積
+                        with self.text_lock:
+                            self.recognized_texts.append({
+                                'text': text,
+                                'timestamp': timestamp,
+                                'time': time.time()
+                            })
                 
             except queue.Empty:
                 continue
@@ -207,6 +225,56 @@ class RealTimeVoiceRecognizer:
             self.audio.terminate()
             print("システム終了")
     
+    def get_recent_texts(self, since_timestamp: Optional[float] = None, limit: Optional[int] = None) -> list:
+        """
+        指定した条件に基づいて音声認識結果を取得
+        
+        Args:
+            since_timestamp: この時刻以降のテキストを取得（None の場合は全て）
+            limit: 取得する最大件数（新しい順、タイムスタンプフィルタ後に適用）
+            
+        Returns:
+            list: 音声認識結果のリスト（時系列順）
+        """
+        with self.text_lock:
+            # まず時刻でフィルタリング
+            if since_timestamp is not None:
+                filtered_texts = [item for item in self.recognized_texts if item['time'] > since_timestamp]
+            else:
+                filtered_texts = self.recognized_texts.copy()
+            
+            # 次に件数制限を適用（最新のN件）
+            if limit is not None and limit > 0:
+                filtered_texts = filtered_texts[-limit:]
+            
+            return filtered_texts
+    
+    def clear_texts(self) -> None:
+        """蓄積された音声認識結果をクリア"""
+        with self.text_lock:
+            self.recognized_texts.clear()
+    
+    def get_and_clear_recent_texts(self, since_timestamp: Optional[float] = None) -> list:
+        """
+        指定したタイムスタンプ以降の音声認識結果を取得してからクリア
+        
+        Args:
+            since_timestamp: この時刻以降のテキストを取得（None の場合は全て）
+            
+        Returns:
+            list: 音声認識結果のリスト
+        """
+        with self.text_lock:
+            if since_timestamp is None:
+                result = self.recognized_texts.copy()
+                self.recognized_texts.clear()
+                return result
+            else:
+                recent_texts = [item for item in self.recognized_texts if item['time'] > since_timestamp]
+                # since_timestamp以降のものを削除
+                self.recognized_texts = [item for item in self.recognized_texts if item['time'] <= since_timestamp]
+                return recent_texts
+
     def __del__(self):
         """デストラクタ"""
         if hasattr(self, 'audio'):
@@ -218,9 +286,9 @@ def main():
     parser = argparse.ArgumentParser(description="リアルタイム音声認識システム")
     parser.add_argument(
         "--model", 
-        default="base",
+        default="medium",
         choices=["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"],
-        help="Whisperモデル名 (デフォルト: base)"
+        help="Whisperモデル名 (デフォルト: medium)"
     )
     parser.add_argument(
         "--device",

@@ -18,3 +18,7 @@ comment.xml
 *.yaml
 *.log
 *.csv
+images/
+!prompt.md
+!voice_readme.md
+test_*
