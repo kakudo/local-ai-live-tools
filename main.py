@@ -1066,8 +1066,8 @@ def main():
             model_name="gemma3:12b",  # 1段階目：画像解析用
             comment_model_name="gemma3:12b",  # 2段階目：コメント生成用（一時的に同じモデル）
             debug_mode=debug_mode,
-            resize_width=640,      # ⚡ 幅: 小さくすると高速化 (デフォルト: 640)
-            resize_height=360,     # ⚡ 高さ: 小さくすると高速化 (デフォルト: 360) 
+            resize_width=960,      # ⚡ 幅: 小さくすると高速化 (デフォルト: 960)
+            resize_height=540,     # ⚡ 高さ: 小さくすると高速化 (デフォルト: 540)
             resize_quality=75      # ⚡ 品質: 低いと高速化・ファイルサイズ削減 (デフォルト: 75)
         )
         
