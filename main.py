@@ -12,12 +12,12 @@ import pygetwindow as gw
 import pyautogui
 import xml.etree.ElementTree as ET
 import os
-from voice import RealTimeVoiceRecognizer
+from voice import RealTimeVoiceRecognizer, RemoteVoiceRecognizer
 
 COMMENT_PATH = "C:\\MultiCommentViewer\\CommentGenerator0.0.8b\\anzen-live-helper\\public\\comment.xml"
 
 class OllamaVisionExplainer:
-    def __init__(self, ollama_url="http://localhost:11434", model_name="gemma3:12b", comment_model_name="deepseek-r1:8b", xml_file=COMMENT_PATH, prompt_file="prompt.md", enable_voice=True, debug_mode=False, resize_width=800, resize_height=600, resize_quality=85):
+    def __init__(self, ollama_url="http://localhost:11434", model_name="gemma3:12b", comment_model_name="deepseek-r1:8b", xml_file=COMMENT_PATH, prompt_file="prompt.md", enable_voice=True, debug_mode=False, resize_width=800, resize_height=600, resize_quality=85, voice_server_url=None):
         """
         Ollama Vision Explainer
         
@@ -32,6 +32,7 @@ class OllamaVisionExplainer:
             resize_width: リサイズ後の幅 (デフォルト: 800)
             resize_height: リサイズ後の高さ (デフォルト: 600)
             resize_quality: JPEG品質 (1-100, デフォルト: 85)
+            voice_server_url: リモート音声認識サーバーのURL (Noneの場合はローカル音声認識を使用)
         """
         self.ollama_url = ollama_url
         self.model_name = model_name
@@ -58,6 +59,7 @@ class OllamaVisionExplainer:
         
         # 音声認識機能
         self.enable_voice = enable_voice
+        self.voice_server_url = voice_server_url
         self.voice_recognizer = None
         self.voice_thread = None
         self.last_ollama_request_time = time.time()
@@ -142,9 +144,20 @@ class OllamaVisionExplainer:
         音声認識システムを初期化
         """
         try:
-            print("🎤 音声認識システムを初期化中...")
-            self.voice_recognizer = RealTimeVoiceRecognizer(model_name="medium")
-            print("[OK] 音声認識システムの初期化が完了しました")
+            if self.voice_server_url:
+                print(f"🎤 リモート音声認識サーバーに接続中... ({self.voice_server_url})")
+                self.voice_recognizer = RemoteVoiceRecognizer(server_url=self.voice_server_url)
+                
+                # サーバーの生存確認
+                if not self.voice_recognizer.is_available():
+                    raise Exception(f"音声認識サーバーに接続できませんでした: {self.voice_server_url}")
+                    
+                print("[OK] リモート音声認識システムに接続しました")
+            else:
+                print("🎤 ローカル音声認識システムを初期化中...")
+                self.voice_recognizer = RealTimeVoiceRecognizer(model_name="medium")
+                print("[OK] ローカル音声認識システムの初期化が完了しました")
+                
         except Exception as e:
             print(f"[Warning] 音声認識システムの初期化に失敗しました: {e}")
             self.enable_voice = False
@@ -157,22 +170,33 @@ class OllamaVisionExplainer:
             return False
         
         try:
-            def voice_thread():
-                print("🎤 音声認識を開始します...")
+            if isinstance(self.voice_recognizer, RemoteVoiceRecognizer):
+                # リモート音声認識の場合
+                print("🎤 リモート音声認識を開始します...")
                 if self.voice_recognizer.start_recording():
-                    self.voice_recognizer.is_processing = True
-                    processing_thread = threading.Thread(target=self.voice_recognizer.processing_thread)
-                    processing_thread.daemon = True
-                    processing_thread.start()
-                    print("音声認識が開始されました")
+                    print("リモート音声認識が開始されました")
+                    return True
                 else:
-                    print("音声認識の開始に失敗しました")
-            
-            self.voice_thread = threading.Thread(target=voice_thread)
-            self.voice_thread.daemon = True
-            self.voice_thread.start()
-            time.sleep(2)  # 初期化待ち
-            return True
+                    print("リモート音声認識の開始に失敗しました")
+                    return False
+            else:
+                # ローカル音声認識の場合
+                def voice_thread():
+                    print("🎤 音声認識を開始します...")
+                    if self.voice_recognizer.start_recording():
+                        self.voice_recognizer.is_processing = True
+                        processing_thread = threading.Thread(target=self.voice_recognizer.processing_thread)
+                        processing_thread.daemon = True
+                        processing_thread.start()
+                        print("音声認識が開始されました")
+                    else:
+                        print("音声認識の開始に失敗しました")
+                
+                self.voice_thread = threading.Thread(target=voice_thread)
+                self.voice_thread.daemon = True
+                self.voice_thread.start()
+                time.sleep(2)  # 初期化待ち
+                return True
             
         except Exception as e:
             print(f"音声認識開始エラー: {e}")
@@ -184,8 +208,13 @@ class OllamaVisionExplainer:
         """
         if self.voice_recognizer:
             try:
-                self.voice_recognizer.is_processing = False
-                self.voice_recognizer.stop_recording()
+                if isinstance(self.voice_recognizer, RemoteVoiceRecognizer):
+                    # リモート音声認識の場合
+                    self.voice_recognizer.stop_recording()
+                else:
+                    # ローカル音声認識の場合
+                    self.voice_recognizer.is_processing = False
+                    self.voice_recognizer.stop_recording()
                 print("[Mute] 音声認識を停止しました")
             except Exception as e:
                 print(f"音声認識停止エラー: {e}")
@@ -1053,25 +1082,39 @@ def main():
     メイン関数
     """
     import sys
+    import argparse
     
     try:
-        # コマンドライン引数でデバッグモードを確認
-        debug_mode = "--debug" in sys.argv or "-d" in sys.argv
+        # コマンドライン引数の解析
+        parser = argparse.ArgumentParser(description="リアルタイム画面解析・コメント生成システム")
+        parser.add_argument("--debug", "-d", action="store_true", help="デバッグモードを有効にする")
+        parser.add_argument("--voice-server", help="リモート音声認識サーバーのURL (例: http://192.168.1.100:5000)")
+        parser.add_argument("--no-voice", action="store_true", help="音声認識を無効にする")
+        parser.add_argument("--ollama-url", default="http://localhost:11434", help="OllamaサーバーのURL (デフォルト: http://localhost:11434)")
+        
+        args = parser.parse_args()
+        
+        # 音声認識設定
+        enable_voice = not args.no_voice
+        voice_server_url = args.voice_server
         
         # アプリケーションを初期化
         # 🎛️ 画像リサイズ設定（処理速度向上のため）
         # - resize_width/height: 大きいほど高解像度だが処理が重い (推奨: 600-1200)
         # - resize_quality: JPEG品質 1-100 (推奨: 70-90)
         explainer = OllamaVisionExplainer(
+            ollama_url=args.ollama_url,  # コマンドライン引数で指定されたOllama URL
             model_name="gemma3:12b",  # 1段階目：画像解析用
             comment_model_name="gemma3:12b",  # 2段階目：コメント生成用（一時的に同じモデル）
-            debug_mode=debug_mode,
+            debug_mode=args.debug,
+            enable_voice=enable_voice,
+            voice_server_url=voice_server_url,
             resize_width=960,      # ⚡ 幅: 小さくすると高速化 (デフォルト: 960)
             resize_height=540,     # ⚡ 高さ: 小さくすると高速化 (デフォルト: 540)
             resize_quality=75      # ⚡ 品質: 低いと高速化・ファイルサイズ削減 (デフォルト: 75)
         )
         
-        if debug_mode:
+        if args.debug:
             print("[Debug] デバッグモードが有効です。画面解析の詳細情報が表示されます。")
         
         # 継続的な解析を開始（5秒間隔）
