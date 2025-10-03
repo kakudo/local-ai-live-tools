@@ -15,6 +15,9 @@ import numpy as np
 import pyaudio
 import whisper
 import torch
+import requests
+from flask import Flask, jsonify, request
+import json
 
 
 class RealTimeVoiceRecognizer:
@@ -281,6 +284,272 @@ class RealTimeVoiceRecognizer:
             self.audio.terminate()
 
 
+class VoiceRecognitionServer:
+    """音声認識WebAPIサーバー"""
+    
+    def __init__(self, model_name: str = "medium", device: Optional[str] = None, host: str = "0.0.0.0", port: int = 5000):
+        """
+        サーバー初期化
+        
+        Args:
+            model_name: Whisperモデル名
+            device: 使用するデバイス
+            host: サーバーホスト (デフォルト: 0.0.0.0)
+            port: サーバーポート (デフォルト: 5000)
+        """
+        self.app = Flask(__name__)
+        self.host = host
+        self.port = port
+        self.recognizer = RealTimeVoiceRecognizer(model_name=model_name, device=device)
+        self.setup_routes()
+        
+    def setup_routes(self):
+        """APIルートの設定"""
+        
+        @self.app.route('/status', methods=['GET'])
+        def get_status():
+            """サーバー状態を取得"""
+            return jsonify({
+                'status': 'ok',
+                'recording': self.recognizer.is_recording,
+                'processing': self.recognizer.is_processing,
+                'device': self.recognizer.device
+            })
+        
+        @self.app.route('/start', methods=['POST'])
+        def start_recording():
+            """音声認識開始"""
+            try:
+                data = request.get_json() if request.is_json else {}
+                device_index = data.get('device_index')
+                
+                if self.recognizer.is_recording:
+                    return jsonify({'error': 'Already recording'}), 400
+                
+                success = self.recognizer.start_recording(device_index=device_index)
+                if success:
+                    # 処理スレッド開始
+                    self.recognizer.is_processing = True
+                    processing_thread = threading.Thread(target=self.recognizer.processing_thread)
+                    processing_thread.daemon = True
+                    processing_thread.start()
+                    
+                    return jsonify({'status': 'started', 'recording': True})
+                else:
+                    return jsonify({'error': 'Failed to start recording'}), 500
+                    
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/stop', methods=['POST'])
+        def stop_recording():
+            """音声認識停止"""
+            try:
+                self.recognizer.is_processing = False
+                self.recognizer.stop_recording()
+                return jsonify({'status': 'stopped', 'recording': False})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/texts', methods=['GET'])
+        def get_texts():
+            """認識されたテキストを取得"""
+            try:
+                since_timestamp = request.args.get('since_timestamp', type=float)
+                limit = request.args.get('limit', type=int)
+                
+                texts = self.recognizer.get_recent_texts(
+                    since_timestamp=since_timestamp,
+                    limit=limit
+                )
+                
+                return jsonify({
+                    'texts': texts,
+                    'count': len(texts)
+                })
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/texts/clear', methods=['POST'])
+        def clear_texts():
+            """認識されたテキストをクリア"""
+            try:
+                self.recognizer.clear_texts()
+                return jsonify({'status': 'cleared'})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/texts/consume', methods=['POST'])
+        def consume_texts():
+            """認識されたテキストを取得してクリア"""
+            try:
+                data = request.get_json() if request.is_json else {}
+                since_timestamp = data.get('since_timestamp')
+                
+                texts = self.recognizer.get_and_clear_recent_texts(
+                    since_timestamp=since_timestamp
+                )
+                
+                return jsonify({
+                    'texts': texts,
+                    'count': len(texts)
+                })
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/devices', methods=['GET'])
+        def get_devices():
+            """利用可能な音声デバイス一覧を取得"""
+            try:
+                devices = []
+                for i in range(self.recognizer.audio.get_device_count()):
+                    device_info = self.recognizer.audio.get_device_info_by_index(i)
+                    devices.append({
+                        'index': i,
+                        'name': device_info['name'],
+                        'max_input_channels': device_info['maxInputChannels'],
+                        'max_output_channels': device_info['maxOutputChannels']
+                    })
+                
+                return jsonify({'devices': devices})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+    
+    def run(self):
+        """サーバー実行"""
+        print(f"音声認識サーバーを起動中... (http://{self.host}:{self.port})")
+        self.app.run(host=self.host, port=self.port, threaded=True)
+
+
+class RemoteVoiceRecognizer:
+    """リモート音声認識クライアント"""
+    
+    def __init__(self, server_url: str = "http://localhost:5000"):
+        """
+        リモート音声認識クライアント初期化
+        
+        Args:
+            server_url: 音声認識サーバーのURL
+        """
+        self.server_url = server_url.rstrip('/')
+        self.session = requests.Session()
+        self.session.timeout = 10
+        self._last_connection_check = 0
+        self._connection_check_interval = 30  # 30秒ごとに接続チェック
+    
+    def _handle_request_error(self, e: Exception, operation: str):
+        """リクエストエラーを処理"""
+        if isinstance(e, requests.exceptions.ConnectionError):
+            print(f"[Warning] 音声認識サーバーに接続できません ({operation}): {self.server_url}")
+        elif isinstance(e, requests.exceptions.Timeout):
+            print(f"[Warning] 音声認識サーバーからの応答がタイムアウトしました ({operation})")
+        else:
+            print(f"[Warning] 音声認識サーバーでエラーが発生しました ({operation}): {e}")
+    
+    def get_status(self) -> dict:
+        """サーバー状態を取得"""
+        try:
+            response = self.session.get(f"{self.server_url}/status")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            self._handle_request_error(e, "状態取得")
+            raise
+    
+    def start_recording(self, device_index: Optional[int] = None) -> bool:
+        """音声認識開始"""
+        try:
+            data = {}
+            if device_index is not None:
+                data['device_index'] = device_index
+            
+            response = self.session.post(f"{self.server_url}/start", json=data)
+            return response.status_code == 200
+        except Exception as e:
+            self._handle_request_error(e, "録音開始")
+            return False
+    
+    def stop_recording(self) -> bool:
+        """音声認識停止"""
+        try:
+            response = self.session.post(f"{self.server_url}/stop")
+            return response.status_code == 200
+        except Exception as e:
+            self._handle_request_error(e, "録音停止")
+            return False
+    
+    def get_recent_texts(self, since_timestamp: Optional[float] = None, limit: Optional[int] = None) -> list:
+        """認識されたテキストを取得"""
+        try:
+            params = {}
+            if since_timestamp is not None:
+                params['since_timestamp'] = since_timestamp
+            if limit is not None:
+                params['limit'] = limit
+            
+            response = self.session.get(f"{self.server_url}/texts", params=params)
+            response.raise_for_status()
+            return response.json()['texts']
+        except Exception as e:
+            self._handle_request_error(e, "テキスト取得")
+            return []
+    
+    def clear_texts(self) -> bool:
+        """認識されたテキストをクリア"""
+        try:
+            response = self.session.post(f"{self.server_url}/texts/clear")
+            return response.status_code == 200
+        except Exception as e:
+            self._handle_request_error(e, "テキストクリア")
+            return False
+    
+    def get_and_clear_recent_texts(self, since_timestamp: Optional[float] = None) -> list:
+        """認識されたテキストを取得してクリア"""
+        try:
+            data = {}
+            if since_timestamp is not None:
+                data['since_timestamp'] = since_timestamp
+            
+            response = self.session.post(f"{self.server_url}/texts/consume", json=data)
+            response.raise_for_status()
+            return response.json()['texts']
+        except Exception as e:
+            self._handle_request_error(e, "テキスト取得・クリア")
+            return []
+    
+    def get_devices(self) -> list:
+        """利用可能な音声デバイス一覧を取得"""
+        try:
+            response = self.session.get(f"{self.server_url}/devices")
+            response.raise_for_status()
+            return response.json()['devices']
+        except Exception as e:
+            self._handle_request_error(e, "デバイス一覧取得")
+            return []
+    
+    def is_available(self) -> bool:
+        """サーバーが利用可能かチェック"""
+        current_time = time.time()
+        
+        # 頻繁な接続チェックを避けるため、インターバルをチェック
+        if current_time - self._last_connection_check < self._connection_check_interval:
+            # 前回のチェックから時間が経っていない場合、簡易チェック
+            try:
+                response = self.session.get(f"{self.server_url}/status", timeout=3)
+                return response.status_code == 200
+            except Exception:
+                return False
+        
+        # 定期的な詳細チェック
+        try:
+            self.get_status()
+            self._last_connection_check = current_time
+            return True
+        except Exception:
+            self._last_connection_check = current_time
+            return False
+
+
 def main():
     """メイン関数"""
     parser = argparse.ArgumentParser(description="リアルタイム音声認識システム")
@@ -305,22 +574,55 @@ def main():
         type=int,
         help="使用する音声デバイスのインデックス"
     )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="WebAPIサーバーモードで起動"
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="サーバーホスト (デフォルト: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5000,
+        help="サーバーポート (デフォルト: 5000)"
+    )
     
     args = parser.parse_args()
     
-    # 音声認識システム初期化
-    recognizer = RealTimeVoiceRecognizer(
-        model_name=args.model,
-        device=args.device
-    )
-    
-    # デバイス一覧表示
-    if args.list_devices:
-        recognizer.list_audio_devices()
-        return
-    
-    # システム実行
-    recognizer.run(device_index=args.device_index)
+    if args.server:
+        # サーバーモード
+        server = VoiceRecognitionServer(
+            model_name=args.model,
+            device=args.device,
+            host=args.host,
+            port=args.port
+        )
+        
+        # デバイス一覧表示
+        if args.list_devices:
+            server.recognizer.list_audio_devices()
+            return
+        
+        # サーバー実行
+        server.run()
+    else:
+        # ローカルモード
+        recognizer = RealTimeVoiceRecognizer(
+            model_name=args.model,
+            device=args.device
+        )
+        
+        # デバイス一覧表示
+        if args.list_devices:
+            recognizer.list_audio_devices()
+            return
+        
+        # システム実行
+        recognizer.run(device_index=args.device_index)
 
 
 if __name__ == "__main__":
