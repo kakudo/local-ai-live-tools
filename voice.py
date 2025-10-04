@@ -575,9 +575,9 @@ def main():
         help="使用する音声デバイスのインデックス"
     )
     parser.add_argument(
-        "--server",
+        "--local",
         action="store_true",
-        help="WebAPIサーバーモードで起動"
+        help="ローカルモードで起動（デフォルトはWebAPIサーバーモード）"
     )
     parser.add_argument(
         "--host",
@@ -593,8 +593,22 @@ def main():
     
     args = parser.parse_args()
     
-    if args.server:
-        # サーバーモード
+    if args.local:
+        # ローカルモード
+        recognizer = RealTimeVoiceRecognizer(
+            model_name=args.model,
+            device=args.device
+        )
+        
+        # デバイス一覧表示
+        if args.list_devices:
+            recognizer.list_audio_devices()
+            return
+        
+        # システム実行
+        recognizer.run(device_index=args.device_index)
+    else:
+        # サーバーモード（デフォルト）
         server = VoiceRecognitionServer(
             model_name=args.model,
             device=args.device,
@@ -609,20 +623,6 @@ def main():
         
         # サーバー実行
         server.run()
-    else:
-        # ローカルモード
-        recognizer = RealTimeVoiceRecognizer(
-            model_name=args.model,
-            device=args.device
-        )
-        
-        # デバイス一覧表示
-        if args.list_devices:
-            recognizer.list_audio_devices()
-            return
-        
-        # システム実行
-        recognizer.run(device_index=args.device_index)
 
 
 if __name__ == "__main__":

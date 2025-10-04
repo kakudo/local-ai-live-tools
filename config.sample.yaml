@@ -1,0 +1,58 @@
+# リアルタイム画面解析・コメント生成システム設定ファイル
+# 
+# 環境固有設定 (ユーザーの環境に合わせて変更してください)
+environment:
+  # OllamaサーバーのURL
+  ollama_url: "http://localhost:11434"
+  
+  # リモート音声認識サーバーのURL (ローカル音声認識を使う場合はnullのまま)
+  voice_server_url: null
+  
+  # XMLコメントファイルの保存先
+  xml_file: "comment.xml"
+
+# 動作設定 (必要に応じて変更してください)
+behavior:
+  # 音声認識を有効にするかどうか
+  enable_voice: true
+  
+  # デバッグモードを有効にするかどうか
+  debug_mode: false
+  
+  # スクリーンショット解析の実行間隔（秒）
+  analysis_interval: 0.1
+
+# AIモデル設定 (高度なユーザー向け)
+models:
+  # 画像解析用モデル名
+  image_analysis_model: "gemma3:12b"
+  
+  # コメント生成用モデル名  
+  comment_generation_model: "gemma3:12b"
+
+# パフォーマンス設定 (高度なユーザー向け)
+performance:
+  # 画像圧縮設定
+  image:
+    # 画像圧縮倍率 (2.0なら縦横それぞれ1/2、面積1/4に圧縮)
+    compression_ratio: 2.0
+    
+    # JPEG品質 1-100 (低いと高速化・ファイルサイズ削減)
+    jpeg_quality: 75
+
+# 人格・コメント設定 (必要に応じて変更してください)
+personas:
+  # 人格定義ファイルのパス
+  personas_file: "personas.yaml"
+  
+  # 毎回選択する人格数 (利用可能な人格数より少なくしてください)
+  select_count: 11
+  
+  # 固定で含める人格ID (省略可能)
+  # 例: ["listener", "safety"] - 毎回必ず含める人格
+  always_include: []
+
+# 固定設定 (通常は変更不要)
+system:
+  # プロンプトファイルのパス (従来の固定プロンプト用、人格システム有効時は無視)
+  prompt_file: "prompt.md"
