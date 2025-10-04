@@ -16,6 +16,8 @@ comment.xml
 *.json
 *.yml
 *.yaml
+!config.sample.yaml
+!personas.sample.yaml
 *.log
 *.csv
 images/

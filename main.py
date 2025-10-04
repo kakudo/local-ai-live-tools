@@ -13,11 +13,14 @@ import pyautogui
 import xml.etree.ElementTree as ET
 import os
 from voice import RealTimeVoiceRecognizer, RemoteVoiceRecognizer
+from config_manager import ConfigManager
+from persona_manager import PersonaManager
 
-COMMENT_PATH = "C:\\MultiCommentViewer\\CommentGenerator0.0.8b\\anzen-live-helper\\public\\comment.xml"
+# デフォルトのXMLファイルパス（プロジェクト直下の相対パス）
+DEFAULT_XML_PATH = "comment.xml"
 
 class OllamaVisionExplainer:
-    def __init__(self, ollama_url="http://localhost:11434", model_name="gemma3:12b", comment_model_name="deepseek-r1:8b", xml_file=COMMENT_PATH, prompt_file="prompt.md", enable_voice=True, debug_mode=False, resize_width=800, resize_height=600, resize_quality=85, voice_server_url=None):
+    def __init__(self, ollama_url="http://localhost:11434", model_name="gemma3:12b", comment_model_name="deepseek-r1:8b", xml_file=DEFAULT_XML_PATH, prompt_file="prompt.md", enable_voice=True, debug_mode=False, compression_ratio=2.0, jpeg_quality=75, voice_server_url=None, persona_config=None):
         """
         Ollama Vision Explainer
         
@@ -29,9 +32,8 @@ class OllamaVisionExplainer:
             prompt_file: プロンプトファイルのパス (デフォルト: prompt.md)
             enable_voice: 音声認識を有効にするかどうか (デフォルト: True)
             debug_mode: 画面解析デバッグモードを有効にするかどうか (デフォルト: False)
-            resize_width: リサイズ後の幅 (デフォルト: 800)
-            resize_height: リサイズ後の高さ (デフォルト: 600)
-            resize_quality: JPEG品質 (1-100, デフォルト: 85)
+            compression_ratio: 画像圧縮倍率 (2.0なら縦横1/2、面積1/4に圧縮, デフォルト: 2.0)
+            jpeg_quality: JPEG品質 (1-100, デフォルト: 75)
             voice_server_url: リモート音声認識サーバーのURL (Noneの場合はローカル音声認識を使用)
         """
         self.ollama_url = ollama_url
@@ -44,10 +46,9 @@ class OllamaVisionExplainer:
         self.prompt_content = self.load_prompt()
         self.debug_mode = debug_mode
         
-        # 画像リサイズ設定
-        self.resize_width = resize_width
-        self.resize_height = resize_height
-        self.resize_quality = resize_quality
+        # 画像圧縮設定
+        self.compression_ratio = compression_ratio
+        self.jpeg_quality = jpeg_quality
         
         # デバッグログファイル
         self.debug_log_file = "screen_analysis_debug.log" if debug_mode else None
@@ -63,6 +64,12 @@ class OllamaVisionExplainer:
         self.voice_recognizer = None
         self.voice_thread = None
         self.last_ollama_request_time = time.time()
+        
+        # 人格管理システム
+        self.persona_config = persona_config
+        self.persona_manager = None
+        if persona_config:
+            self.persona_manager = PersonaManager(persona_config.personas_file)
         
         if self.enable_voice:
             self.init_voice_recognition()
@@ -93,7 +100,7 @@ class OllamaVisionExplainer:
 
     def resize_image(self, image):
         """
-        画像をリサイズして処理速度を向上させる
+        画像を圧縮率に基づいてリサイズして処理速度を向上させる
         
         Args:
             image: PIL.Image オリジナル画像
@@ -103,21 +110,26 @@ class OllamaVisionExplainer:
         """
         try:
             original_size = image.size
+            original_width, original_height = original_size
+            
+            # 圧縮率に基づいて新しいサイズを計算
+            new_width = int(original_width / self.compression_ratio)
+            new_height = int(original_height / self.compression_ratio)
             
             # アスペクト比を維持してリサイズ
-            image.thumbnail((self.resize_width, self.resize_height), Image.Resampling.LANCZOS)
+            image.thumbnail((new_width, new_height), Image.Resampling.LANCZOS)
             
             resized_size = image.size
             
             # デバッグモードの場合、リサイズ情報を表示
             if self.debug_mode:
-                compression_ratio = (original_size[0] * original_size[1]) / (resized_size[0] * resized_size[1])
-                print(f"[画像リサイズ] {original_size} → {resized_size} (圧縮率: {compression_ratio:.2f}x)")
+                actual_compression = (original_size[0] * original_size[1]) / (resized_size[0] * resized_size[1])
+                print(f"[画像圧縮] {original_size} → {resized_size} (面積圧縮率: {actual_compression:.2f}x)")
             
             return image
             
         except Exception as e:
-            print(f"画像リサイズエラー: {e}")
+            print(f"画像圧縮エラー: {e}")
             return image
 
     def load_prompt(self):
@@ -304,13 +316,13 @@ class OllamaVisionExplainer:
                 resized_image = rgb_image
             
             buffer = io.BytesIO()
-            resized_image.save(buffer, format='JPEG', quality=self.resize_quality, optimize=True)
+            resized_image.save(buffer, format='JPEG', quality=self.jpeg_quality, optimize=True)
             buffer.seek(0)
             
             # ファイルサイズ情報を表示
             file_size_kb = len(buffer.getvalue()) / 1024
             if self.debug_mode:
-                print(f"[画像圧縮] 品質: {self.resize_quality}, サイズ: {file_size_kb:.1f}KB")
+                print(f"[JPEG圧縮] 品質: {self.jpeg_quality}, サイズ: {file_size_kb:.1f}KB")
             
             image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
             return image_base64
@@ -428,53 +440,49 @@ class OllamaVisionExplainer:
             dict: 解析されたJSON形式のレスポンス（エラーの場合は文字列）
         """
         try:
-            # 画像解析結果を含む完全なプロンプトを作成
-            voice_section = f"\n\n音声入力から認識されたテキスト:\n{voice_context}" if voice_context else ""
-            
-            # 画像解析結果を組み込んだプロンプト
-            enhanced_prompt = f"""{self.prompt_content}
-
-===画像解析結果（第1段階で取得）===
+            # 人格管理システムを使用する場合
+            if self.persona_manager:
+                # ランダムに人格を選択
+                always_include = self.persona_config.always_include if self.persona_config else []
+                exclude_from_random = always_include.copy()
+                
+                # 固定人格を追加
+                selected_personas = []
+                for persona_id in always_include:
+                    persona = self.persona_manager.get_persona(persona_id)
+                    if persona:
+                        selected_personas.append(persona)
+                
+                # 残りをランダム選択
+                remaining_count = self.persona_config.select_count - len(selected_personas)
+                if remaining_count > 0:
+                    random_personas = self.persona_manager.get_random_personas(
+                        remaining_count, exclude=exclude_from_random
+                    )
+                    selected_personas.extend(random_personas)
+                
+                # 人格用プロンプトを生成
+                enhanced_prompt = self.persona_manager.create_prompt_for_personas(
+                    selected_personas, voice_context, self.prompt_file
+                )
+                
+                # 画像解析結果を組み込み
+                enhanced_prompt = f"""===画像解析結果（第1段階で取得）===
 {image_analysis_text}
 ===
 
-上記の画像解析結果を基に、プロンプトの指示に従って11人の人格からのコメントを生成してください。{voice_section}
+上記の画像解析結果を基に、以下の指示に従ってコメントを生成してください。
 
 **注意**: 画像解析結果にプログラミング環境、ブラウザ、デスクトップ、オフィスソフトなどが含まれている場合は、ゲーム画面でないと判定し、全て「none」でコメントしてください。
 
-**重要**: 出力は必ず以下のJSON形式で、各フィールドには実際のコメント文字列を入力してください：
-```json
-{{
-  "listener": "実際のコメント文字列",
-  "safety": "実際のコメント文字列", 
-  "expert": "実際のコメント文字列",
-  "fan1": "実際のコメント文字列",
-  "fan2": "実際のコメント文字列",
-  "anti": "実際のコメント文字列",
-  "jikatari": "実際のコメント文字列",
-  "ero": "実際のコメント文字列",
-  "shogaku": "実際のコメント文字列",
-  "question": "実際のコメント文字列",
-  "kaomoji": "実際のコメント文字列"
-}}
-```"""
-            
-            # prompt.mdの出力形式に合わせたフォーマット（11人構成）
-            format_props = {
-                "listener": {"type": "string"},
-                "safety": {"type": "string"},
-                "expert": {"type": "string"},
-                "fan1": {"type": "string"},
-                "fan2": {"type": "string"},
-                "anti": {"type": "string"},
-                "jikatari": {"type": "string"},
-                "ero": {"type": "string"},
-                "shogaku": {"type": "string"},
-                "question": {"type": "string"},
-                "kaomoji": {"type": "string"}
-            }
-            
-            required_fields = ["listener", "safety", "expert", "fan1", "fan2", "anti", "jikatari", "ero", "shogaku", "question", "kaomoji"]
+{enhanced_prompt}"""
+                
+                # JSON形式を動的に構築
+                format_props = {}
+                for persona in selected_personas:
+                    format_props[persona.persona_id] = {"type": "string"}
+                
+                required_fields = [persona.persona_id for persona in selected_personas]
             
             payload = {
                 "model": self.comment_model_name,
@@ -508,8 +516,9 @@ class OllamaVisionExplainer:
             if self.debug_mode:
                 print(f"[DEBUG] Ollamaからの生レスポンス:\n{raw_response}")
             
-            # JSONレスポンスを解析
-            parsed_response = self.parse_json_response(raw_response)
+            # JSONレスポンスを解析（選択された人格情報を渡す）
+            expected_persona_ids = [persona.persona_id for persona in selected_personas] if 'selected_personas' in locals() else None
+            parsed_response = self.parse_json_response(raw_response, expected_persona_ids)
             
             return parsed_response
             
@@ -521,112 +530,14 @@ class OllamaVisionExplainer:
             return f"エラー: コメント生成API呼び出しに失敗しました: {e}"
         except Exception as e:
             return f"エラー: コメント生成中に予期しないエラーが発生しました: {e}"
-    
-    def send_to_ollama(self, image_base64, image=None, prompt=""):
-        """
-        [非推奨] 旧来の統合処理メソッド
-        新しい2段階処理（send_image_analysis_to_ollama + send_comment_generation_to_ollama）を使用してください
-        
-        Args:
-            image_base64: Base64エンコードされた画像
-            image: PIL.Image オブジェクト（デバッグ保存用、オプション）
-            prompt: 送信するプロンプト
-            
-        Returns:
-            dict: 解析されたJSON形式のレスポンス（エラーの場合は文字列）
-        """
-        try:
-            # デバッグ用に画像を保存
-            if image is not None:
-                self.save_debug_image(image)
-            
-            # 音声認識結果を取得
-            voice_context = self.get_voice_context()
-            
-            # ファイルからプロンプトを補完する
-            full_prompt = self.create_prompt_with_prompt(prompt)
 
-            # 音声情報を含むプロンプトを補完する
-            if voice_context:
-                enhanced_prompt = f"{full_prompt}\n\n-----\n以下の配信者の発言履歴も考慮してコメントしてください。\n※直近30秒以内の発言で、[]内は何秒前の発言かを示しています。\n\n{voice_context}\n-----"
-            else:
-                enhanced_prompt = f"{full_prompt}\n\n配信者は直近30秒間発言していません。"
-
-            # デバッグ: 送信するプロンプトを確認
-            if self.debug_mode:
-                print(f"[DEBUG] コメント生成モデル: {self.comment_model_name}")
-                print(f"[DEBUG] 送信するプロンプト (最初の500文字):\n{enhanced_prompt[:500]}...")
-                print(f"[DEBUG] プロンプト全体の文字数: {len(enhanced_prompt)}")
-            
-            
-            # 11人構成用のフォーマット
-            format_props = {
-                "listener": {"type": "string"},
-                "safety": {"type": "string"},
-                "expert": {"type": "string"},
-                "fan1": {"type": "string"},
-                "fan2": {"type": "string"},
-                "anti": {"type": "string"},
-                "jikatari": {"type": "string"},
-                "ero": {"type": "string"},
-                "shogaku": {"type": "string"},
-                "question": {"type": "string"},
-                "kaomoji": {"type": "string"}
-            }
-            
-            required_fields = ["listener", "safety", "expert", "fan1", "fan2", "anti", "jikatari", "ero", "shogaku", "question", "kaomoji"]
-            
-            payload = {
-                "model": self.comment_model_name,
-                "prompt": enhanced_prompt,
-                "images": [image_base64],
-                "stream": False,
-                "format": {
-                    "type": "object",
-                    "properties": format_props,
-                    "required": required_fields
-                }
-            }
-            
-            headers = {
-                "Content-Type": "application/json"
-            }
-            
-            response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
-            response.raise_for_status()
-            
-            result = response.json()
-            raw_response = result.get("response", "")
-            
-            # デバッグ: 生のレスポンスを確認
-            if self.debug_mode:
-                print(f"[DEBUG] Ollamaからの生レスポンス:\n{raw_response}")
-            
-            # リクエスト送信後の処理
-            self.update_last_request_time()
-            
-            # JSONレスポンスを解析
-            parsed_response = self.parse_json_response(raw_response)
-            
-
-            
-            return parsed_response
-            
-        except requests.exceptions.ConnectionError:
-            return "エラー: Ollamaサーバーに接続できません。Ollamaが起動していることを確認してください。"
-        except requests.exceptions.Timeout:
-            return "エラー: コメント生成リクエストがタイムアウトしました。"
-        except requests.exceptions.RequestException as e:
-            return f"エラー: API呼び出しに失敗しました: {e}"
-        except Exception as e:
-            return f"エラー: 予期しないエラーが発生しました: {e}"
-    
-    def parse_json_response(self, raw_response):
+    def parse_json_response(self, raw_response, expected_persona_ids=None):
         """
         OllamaからのJSONレスポンスを解析
         
         Args:
             raw_response: Ollamaからの生のレスポンス文字列
+            expected_persona_ids: 期待される人格IDのリスト（人格管理システム用）
             
         Returns:
             dict: 解析されたJSON（エラーの場合は文字列）
@@ -637,31 +548,55 @@ class OllamaVisionExplainer:
             
             # 期待される構造を検証
             if isinstance(parsed_json, dict):
-                # 必要なキーが存在するかチェック（11人構成）
-                expected_keys = ["listener", "safety", "expert", "fan1", "fan2", "anti", "jikatari", "ero", "shogaku", "question", "kaomoji"]
+                # 人格管理システムを使用している場合
+                if expected_persona_ids:
+                    # 期待される人格IDのいずれかが含まれているかをチェック
+                    received_keys = set(parsed_json.keys())
+                    expected_keys = set(expected_persona_ids)
+                    
+                    # 少なくとも1つの期待される人格が含まれていればOK
+                    if received_keys.intersection(expected_keys):
+                        return parsed_json
+                    else:
+                        print(f"[Warning] 期待される人格が見つかりません。期待: {expected_persona_ids}, 受信: {list(received_keys)}")
+                        return parsed_json  # エラーにせず、そのまま返す（後続処理で適切にフィルタされる）
                 
-                # キーの互換性チェック（新形式）
-                if all(key in parsed_json for key in expected_keys):
-                    return parsed_json
-                elif "safety_monitor" in parsed_json and "game_expert" in parsed_json:
-                    # 旧3人形式の場合、新11人形式に変換（残り8人は"none"で埋める）
-                    converted = {
-                        "listener": parsed_json.get("listener", {"comment": ""}) if isinstance(parsed_json.get("listener"), dict) else parsed_json.get("listener", ""),
-                        "safety": parsed_json.get("safety_monitor", {"comment": ""}) if isinstance(parsed_json.get("safety_monitor"), dict) else parsed_json.get("safety_monitor", ""),
-                        "expert": parsed_json.get("game_expert", {"comment": ""}) if isinstance(parsed_json.get("game_expert"), dict) else parsed_json.get("game_expert", ""),
-                        "fan1": "none",
-                        "fan2": "none", 
-                        "anti": "none",
-                        "jikatari": "none",
-                        "ero": "none",
-                        "shogaku": "none",
-                        "question": "none",
-                        "kaomoji": "none"
-                    }
-                    return converted
+                # 従来の固定人格システム（後方互換性）
                 else:
-                    print(f"[Warning] JSON構造が期待と異なります: {parsed_json}")
-                    return f"JSON構造エラー: 期待されるキー({expected_keys})が不足しています"
+                    # 固定人格の既知キー
+                    known_persona_keys = ["listener", "safety", "expert", "fan1", "fan2", "anti", "jikatari", "ero", "shogaku", "question", "kaomoji", "safety_monitor", "game_expert"]
+                    
+                    # 受信したキーのいずれかが既知の人格キーか確認
+                    received_keys = set(parsed_json.keys())
+                    known_keys = set(known_persona_keys)
+                    
+                    if received_keys.intersection(known_keys):
+                        # 旧形式（safety_monitor, game_expert）があれば新形式に変換
+                        if "safety_monitor" in parsed_json or "game_expert" in parsed_json:
+                            converted = {}
+                            # 既存のキーを新形式にマッピング
+                            key_mapping = {
+                                "safety_monitor": "safety",
+                                "game_expert": "expert"
+                            }
+                            
+                            for old_key, new_key in key_mapping.items():
+                                if old_key in parsed_json:
+                                    value = parsed_json[old_key]
+                                    converted[new_key] = value if isinstance(value, str) else value.get("comment", "")
+                            
+                            # その他のキーもそのまま追加
+                            for key, value in parsed_json.items():
+                                if key not in ["safety_monitor", "game_expert"]:
+                                    converted[key] = value
+                            
+                            return converted
+                        else:
+                            # 新形式の部分的な人格データとしてそのまま返す
+                            return parsed_json
+                    else:
+                        print(f"[Warning] 未知の人格構造: {received_keys}")
+                        return parsed_json  # そのまま返して後続処理に委ねる
             else:
                 return f"JSON形式エラー: オブジェクト形式ではありません"
                 
@@ -748,23 +683,32 @@ class OllamaVisionExplainer:
                 - str: 従来通りの単一コメント
         """
         if isinstance(response_data, dict):
-            # JSON形式の複数人格レスポンス（11人構成）
-            persona_info = {
-                "listener": {"handle": "リスナーbot", "persona": "リスナー"},
-                "safety": {"handle": "安全監視bot", "persona": "安全監視員"}, 
-                "expert": {"handle": "ゲーム専門bot", "persona": "ゲーム専門家"},
-                "fan1": {"handle": "ファン1", "persona": "配信者ファン1"},
-                "fan2": {"handle": "ファン2", "persona": "配信者ファン2"},
-                "anti": {"handle": "アンチ", "persona": "配信者アンチ"},
-                "jikatari": {"handle": "店長", "persona": "自分語り"},
-                "ero": {"handle": "エロ爺", "persona": "エロ爺"},
-                "shogaku": {"handle": "小学生", "persona": "小学生"},
-                "question": {"handle": "質問者", "persona": "質問の人"},
-                "kaomoji": {"handle": "顔文字", "persona": "顔文字の人"},
-                # 互換性のため旧形式も対応
-                "safety_monitor": {"handle": "安全監視bot", "persona": "安全監視員"}, 
-                "game_expert": {"handle": "ゲーム専門bot", "persona": "ゲーム専門家"}
-            }
+            # 人格管理システムを使用する場合の人格情報を取得
+            if self.persona_manager:
+                persona_info = {}
+                for persona_id, persona in self.persona_manager.get_all_personas().items():
+                    persona_info[persona_id] = {
+                        "handle": persona.handle,
+                        "persona": persona.name
+                    }
+            else:
+                # 従来の固定人格情報
+                persona_info = {
+                    "listener": {"handle": "リスナーbot", "persona": "リスナー"},
+                    "safety": {"handle": "安全監視bot", "persona": "安全監視員"}, 
+                    "expert": {"handle": "ゲーム専門bot", "persona": "ゲーム専門家"},
+                    "fan1": {"handle": "ファン1", "persona": "配信者ファン1"},
+                    "fan2": {"handle": "ファン2", "persona": "配信者ファン2"},
+                    "anti": {"handle": "アンチ", "persona": "配信者アンチ"},
+                    "jikatari": {"handle": "店長", "persona": "自分語り"},
+                    "ero": {"handle": "エロ爺", "persona": "エロ爺"},
+                    "shogaku": {"handle": "小学生", "persona": "小学生"},
+                    "question": {"handle": "質問者", "persona": "質問の人"},
+                    "kaomoji": {"handle": "顔文字", "persona": "顔文字の人"},
+                    # 互換性のため旧形式も対応
+                    "safety_monitor": {"handle": "安全監視bot", "persona": "安全監視員"}, 
+                    "game_expert": {"handle": "ゲーム専門bot", "persona": "ゲーム専門家"}
+                }
             
             # 有効なコメントを収集
             valid_comments = []
@@ -774,7 +718,8 @@ class OllamaVisionExplainer:
                 # デバッグフィールドはスキップ
                 if persona in ["screen_analysis"]:
                     continue
-                    
+                
+                # 人格情報が存在するかチェック
                 if persona in persona_info:
                     # prompt.md形式では直接文字列、旧形式ではオブジェクト
                     if isinstance(comment_data, dict):
@@ -799,6 +744,10 @@ class OllamaVisionExplainer:
                             # timestampは削除 - XML出力時に生成する
                         }
                         valid_comments.append(comment_item)
+                else:
+                    # 未知の人格IDの場合のログ出力
+                    if self.debug_mode:
+                        print(f"[Debug] 未知の人格ID: {persona} - スキップしました")
             
             # 有効なコメントがある場合のみランダムな順序でキューに追加
             if valid_comments:
@@ -1087,38 +1036,69 @@ def main():
     try:
         # コマンドライン引数の解析
         parser = argparse.ArgumentParser(description="リアルタイム画面解析・コメント生成システム")
+        
+        # 重要な設定のみコマンドライン引数として残す
+        parser.add_argument("--config", "-c", help="設定ファイルのパス (デフォルト: config.yaml)")
         parser.add_argument("--debug", "-d", action="store_true", help="デバッグモードを有効にする")
-        parser.add_argument("--voice-server", help="リモート音声認識サーバーのURL (例: http://192.168.1.100:5000)")
         parser.add_argument("--no-voice", action="store_true", help="音声認識を無効にする")
-        parser.add_argument("--ollama-url", default="http://localhost:11434", help="OllamaサーバーのURL (デフォルト: http://localhost:11434)")
+        parser.add_argument("--ollama-url", help="OllamaサーバーのURL")
+        parser.add_argument("--voice-server", help="リモート音声認識サーバーのURL")
+        parser.add_argument("--xml-file", help="XMLコメントファイルの保存先")
+        parser.add_argument("--interval", type=float, help="スクリーンショット解析の実行間隔（秒）")
+        parser.add_argument("--create-config", action="store_true", help="config.sample.yaml を config.yaml にコピーして終了")
+        parser.add_argument("--create-personas", action="store_true", help="personas.sample.yaml を personas.yaml にコピーして終了")
         
         args = parser.parse_args()
         
-        # 音声認識設定
-        enable_voice = not args.no_voice
-        voice_server_url = args.voice_server
+        # サンプル設定ファイル作成
+        if args.create_config:
+            config_manager = ConfigManager(suppress_warnings=True)
+            config_manager.create_sample_config()
+            return
         
-        # アプリケーションを初期化
-        # 🎛️ 画像リサイズ設定（処理速度向上のため）
-        # - resize_width/height: 大きいほど高解像度だが処理が重い (推奨: 600-1200)
-        # - resize_quality: JPEG品質 1-100 (推奨: 70-90)
-        explainer = OllamaVisionExplainer(
-            ollama_url=args.ollama_url,  # コマンドライン引数で指定されたOllama URL
-            model_name="gemma3:12b",  # 1段階目：画像解析用
-            comment_model_name="gemma3:12b",  # 2段階目：コメント生成用（一時的に同じモデル）
-            debug_mode=args.debug,
-            enable_voice=enable_voice,
-            voice_server_url=voice_server_url,
-            resize_width=960,      # ⚡ 幅: 小さくすると高速化 (デフォルト: 960)
-            resize_height=540,     # ⚡ 高さ: 小さくすると高速化 (デフォルト: 540)
-            resize_quality=75      # ⚡ 品質: 低いと高速化・ファイルサイズ削減 (デフォルト: 75)
+        # サンプル人格ファイル作成
+        if args.create_personas:
+            persona_manager = PersonaManager(suppress_warnings=True)  # 警告を抑制
+            persona_manager.create_personas_file()
+            return
+        
+        # 設定ファイル読み込み（デフォルトでconfig.yamlを使用）
+        config_file = args.config or "config.yaml"
+        config_manager = ConfigManager(config_file)
+        
+        # コマンドライン引数で設定をオーバーライド
+        config = config_manager.override_with_args(
+            ollama_url=args.ollama_url,
+            voice_server_url=args.voice_server,
+            xml_file=args.xml_file,
+            enable_voice=not args.no_voice if args.no_voice else None,
+            debug_mode=args.debug if args.debug else None,
+            analysis_interval=args.interval
         )
         
-        if args.debug:
+        # 設定を表示
+        config_manager.print_config()
+        
+        # アプリケーションを初期化（設定ファイルベース）
+        explainer = OllamaVisionExplainer(
+            ollama_url=config.environment.ollama_url,
+            model_name=config.models.image_analysis_model,
+            comment_model_name=config.models.comment_generation_model,
+            xml_file=config.environment.xml_file,
+            prompt_file=config.system.prompt_file,
+            enable_voice=config.behavior.enable_voice,
+            debug_mode=config.behavior.debug_mode,
+            compression_ratio=config.performance.image.compression_ratio,
+            jpeg_quality=config.performance.image.jpeg_quality,
+            voice_server_url=config.environment.voice_server_url,
+            persona_config=config.personas
+        )
+        
+        if config.behavior.debug_mode:
             print("[Debug] デバッグモードが有効です。画面解析の詳細情報が表示されます。")
         
-        # 継続的な解析を開始（5秒間隔）
-        explainer.run_continuous_analysis(interval=0.1)
+        # 継続的な解析を開始
+        explainer.run_continuous_analysis(interval=config.behavior.analysis_interval)
         
     except Exception as e:
         print(f"アプリケーション起動エラー: {e}")
