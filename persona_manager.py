@@ -19,7 +19,6 @@ class Persona:
     handle: str
     description: str
     style: str
-    example: str
 
 
 class PersonaManager:
@@ -54,8 +53,7 @@ class PersonaManager:
                         name=persona_info.get('name', persona_id),
                         handle=persona_info.get('handle', persona_id),
                         description=persona_info.get('description', ''),
-                        style=persona_info.get('style', ''),
-                        example=persona_info.get('example', '')
+                        style=persona_info.get('style', '')
                     )
                 
                 if not self.suppress_warnings:
@@ -115,7 +113,7 @@ class PersonaManager:
         selected_ids = random.sample(list(available_personas.keys()), count)
         return [available_personas[persona_id] for persona_id in selected_ids]
     
-    def create_prompt_for_personas(self, selected_personas: List[Persona], voice_context: str = "", prompt_file: str = "prompt.md") -> str:
+    def create_prompt_for_personas(self, selected_personas: List[Persona], voice_context: str = "", prompt_file: str = "prompt.md", summary_context: str = "") -> str:
         """
         選択された人格用のプロンプトを生成
         
@@ -123,6 +121,7 @@ class PersonaManager:
             selected_personas: 選択された人格のリスト
             voice_context: 音声認識コンテキスト
             prompt_file: プロンプトテンプレートファイルのパス
+            summary_context: ゲーム要約情報のコンテキスト
             
         Returns:
             生成されたプロンプト
@@ -156,16 +155,20 @@ class PersonaManager:
         
         for i, persona in enumerate(selected_personas, 1):
             persona_descriptions.append(
-                f"{i}. **{persona.name}**: {persona.description}\n   スタイル: {persona.style}\n   例: {persona.example}"
+                f"{i}. **{persona.name}**: {persona.description}\n   スタイル: {persona.style}"
             )
             json_fields.append(f'  "{persona.persona_id}": "画面の具体的要素1つに言及した短いコメント（20文字以内、ゲーム画面でない場合は「none」）"')
         
         # 音声セクションを生成
         voice_section = f"\n\n**音声認識結果:**\n{voice_context}" if voice_context else ""
         
+        # 要約セクションを生成
+        summary_section = summary_context if summary_context else "（ゲームプレイの要約情報はありません）"
+        
         # プレースホルダーを置換
         prompt = prompt_template.replace("{PERSONA_DESCRIPTIONS}", chr(10).join(persona_descriptions))
         prompt = prompt.replace("{VOICE_CONTEXT}", voice_section)
+        prompt = prompt.replace("{SUMMARY_CONTEXT}", summary_section)
         prompt = prompt.replace("{JSON_FIELDS}", chr(10).join(json_fields))
         
         return prompt
@@ -194,7 +197,7 @@ class PersonaManager:
         for persona_id, persona in self.personas.items():
             print(f"  {persona_id}: {persona.name} ({persona.handle})")
             print(f"    - {persona.description}")
-            print(f"    - 例: \"{persona.example}\"")
+            print(f"    - スタイル: {persona.style}")
         print("=" * 50)
     
     def create_personas_file(self, output_path: str = None) -> str:

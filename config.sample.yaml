@@ -32,13 +32,17 @@ models:
 
 # パフォーマンス設定 (高度なユーザー向け)
 performance:
-  # 画像圧縮設定
+  # 画像処理設定
   image:
     # 画像圧縮倍率 (2.0なら縦横それぞれ1/2、面積1/4に圧縮)
-    compression_ratio: 2.0
+    compression_ratio: 3.0
     
     # JPEG品質 1-100 (低いと高速化・ファイルサイズ削減)
     jpeg_quality: 75
+    
+    # 画像バッファ設定
+    buffer_size: 30        # 保管する画像の最大数 (超過分は古い順に削除)
+    images_per_request: 10  # Ollamaに送信する画像数 (新しい順から取得、時系列順で送信)
 
 # 人格・コメント設定 (必要に応じて変更してください)
 personas:
@@ -56,3 +60,6 @@ personas:
 system:
   # プロンプトテンプレートファイルのパス (人格システムでプレースホルダー置換用テンプレートとして使用)
   prompt_file: "prompt.md"
+  
+  # 要約実行のための解説蓄積上限数 (この数に達すると自動で要約を生成)
+  max_logs: 10

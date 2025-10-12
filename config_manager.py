@@ -38,6 +38,8 @@ class ImageConfig:
     """画像処理設定"""
     compression_ratio: float = 2.0
     jpeg_quality: int = 75
+    buffer_size: int = 10
+    images_per_request: int = 3
 
 
 @dataclass
@@ -62,6 +64,7 @@ class PersonasConfig:
 class SystemConfig:
     """システム設定"""
     prompt_file: str = "prompt.md"
+    max_logs: int = 30  # 要約実行のための解説蓄積上限数
 
 
 @dataclass
@@ -146,7 +149,9 @@ class ConfigManager:
             performance=PerformanceConfig(
                 image=ImageConfig(
                     compression_ratio=image_data.get('compression_ratio', 2.0),
-                    jpeg_quality=image_data.get('jpeg_quality', 75)
+                    jpeg_quality=image_data.get('jpeg_quality', 75),
+                    buffer_size=image_data.get('buffer_size', 10),
+                    images_per_request=image_data.get('images_per_request', 3)
                 )
             ),
             personas=PersonasConfig(
@@ -155,7 +160,8 @@ class ConfigManager:
                 always_include=personas_data.get('always_include', [])
             ),
             system=SystemConfig(
-                prompt_file=system_data.get('prompt_file', "prompt.md")
+                prompt_file=system_data.get('prompt_file', "prompt.md"),
+                max_logs=system_data.get('max_logs', 30)
             )
         )
     
@@ -247,6 +253,8 @@ class ConfigManager:
         print(f"コメント生成モデル: {self.config.models.comment_generation_model}")
         print(f"画像圧縮倍率: {self.config.performance.image.compression_ratio}x")
         print(f"JPEG品質: {self.config.performance.image.jpeg_quality}")
+        print(f"画像バッファサイズ: {self.config.performance.image.buffer_size}")
+        print(f"送信画像数: {self.config.performance.image.images_per_request}")
         print(f"人格ファイル: {self.config.personas.personas_file}")
         print(f"選択人格数: {self.config.personas.select_count}")
         if self.config.personas.always_include:
