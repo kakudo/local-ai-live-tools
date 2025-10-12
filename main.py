@@ -20,7 +20,7 @@ from persona_manager import PersonaManager
 DEFAULT_XML_PATH = "comment.xml"
 
 class OllamaVisionExplainer:
-    def __init__(self, ollama_url="http://localhost:11434", model_name="gemma3:12b", comment_model_name="deepseek-r1:8b", xml_file=DEFAULT_XML_PATH, prompt_file="prompt.md", enable_voice=True, debug_mode=False, compression_ratio=2.0, jpeg_quality=75, voice_server_url=None, persona_config=None):
+    def __init__(self, ollama_url="http://localhost:11434", model_name="gemma3:12b", comment_model_name="deepseek-r1:8b", xml_file=DEFAULT_XML_PATH, prompt_file="prompt.md", enable_voice=True, debug_mode=False, compression_ratio=3.0, jpeg_quality=75, voice_server_url=None, persona_config=None, image_buffer_size=30, images_per_request=10, max_logs=10):
         """
         Ollama Vision Explainer
         
@@ -32,9 +32,13 @@ class OllamaVisionExplainer:
             prompt_file: プロンプトファイルのパス (デフォルト: prompt.md)
             enable_voice: 音声認識を有効にするかどうか (デフォルト: True)
             debug_mode: 画面解析デバッグモードを有効にするかどうか (デフォルト: False)
-            compression_ratio: 画像圧縮倍率 (2.0なら縦横1/2、面積1/4に圧縮, デフォルト: 2.0)
+            compression_ratio: 画像圧縮倍率 (2.0なら縦横1/2、面積1/4に圧縮, デフォルト: 3.0)
             jpeg_quality: JPEG品質 (1-100, デフォルト: 75)
             voice_server_url: リモート音声認識サーバーのURL (Noneの場合はローカル音声認識を使用)
+            persona_config: 人格設定 (PersonasConfig)
+            image_buffer_size: 画像バッファサイズ (デフォルト: 30)
+            images_per_request: 1回のリクエストで送信する画像数 (デフォルト: 10)
+            max_logs: 要約実行のための解説蓄積上限数 (デフォルト: 10)
         """
         self.ollama_url = ollama_url
         self.model_name = model_name
@@ -52,6 +56,8 @@ class OllamaVisionExplainer:
         
         # デバッグログファイル
         self.debug_log_file = "screen_analysis_debug.log" if debug_mode else None
+        self.debug_analysis_file = "debug_analysis_responses.log" if debug_mode else None  # Ollama画像解析結果用
+        self.debug_summary_file = "debug_summaries.log" if debug_mode else None  # 要約結果用
         
         # コメントキューシステム
         self.comment_queue = queue.Queue()
@@ -70,6 +76,22 @@ class OllamaVisionExplainer:
         self.persona_manager = None
         if persona_config:
             self.persona_manager = PersonaManager(persona_config.personas_file)
+        
+        # 画像バッファリングシステム
+        self.image_buffer_size = image_buffer_size
+        self.images_per_request = images_per_request
+        self.image_buffer = queue.Queue()  # スレッドセーフなキュー
+        self.screenshot_thread = None
+        self.screenshot_thread_running = False
+        
+        # 解説蓄積システム
+        self.analysis_logs = []  # 解説を蓄積するリスト
+        self.max_logs = max_logs
+        self.summary_file = "game_summary.txt"  # 要約ファイルのパス
+        
+        # デバッグファイル初期化
+        if debug_mode:
+            self.init_debug_files()
         
         if self.enable_voice:
             self.init_voice_recognition()
@@ -95,6 +117,12 @@ class OllamaVisionExplainer:
         # 全角括弧パターン: （〇〇文字）
         comment = re.sub(r'（[0-9０-９]+文字）$', '', comment)
         
+        # 半角括弧パターン: (〇〇)
+        comment = re.sub(r'\([0-9０-９]+\)$', '', comment)
+        
+        # 全角括弧パターン: （〇〇）
+        comment = re.sub(r'（[0-9０-９]+）$', '', comment)
+
         # 前後の空白を除去
         return comment.strip()
 
@@ -109,12 +137,26 @@ class OllamaVisionExplainer:
             PIL.Image: リサイズ済み画像
         """
         try:
+            # 画像の有効性をチェック
+            if image is None:
+                print("[リサイズエラー] 画像がNoneです")
+                return None
+            
             original_size = image.size
             original_width, original_height = original_size
+            
+            # 元画像サイズの有効性をチェック
+            if original_width <= 0 or original_height <= 0:
+                print(f"[リサイズエラー] 無効な元画像サイズ: {original_size}")
+                return image  # 元の画像をそのまま返す
             
             # 圧縮率に基づいて新しいサイズを計算
             new_width = int(original_width / self.compression_ratio)
             new_height = int(original_height / self.compression_ratio)
+            
+            # 最小サイズを保証（1x1以上）
+            new_width = max(1, new_width)
+            new_height = max(1, new_height)
             
             # アスペクト比を維持してリサイズ
             image.thumbnail((new_width, new_height), Image.Resampling.LANCZOS)
@@ -131,6 +173,37 @@ class OllamaVisionExplainer:
         except Exception as e:
             print(f"画像圧縮エラー: {e}")
             return image
+    
+    def init_debug_files(self):
+        """
+        デバッグファイルを初期化（開始時のヘッダー情報を書き込み）
+        """
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 画像解析デバッグファイル初期化
+            if self.debug_analysis_file:
+                with open(self.debug_analysis_file, 'w', encoding='utf-8') as f:
+                    f.write(f"Ollama画像解析デバッグログ\n")
+                    f.write(f"開始日時: {current_time}\n")
+                    f.write(f"画像解析モデル: {self.model_name}\n")
+                    f.write(f"画像バッファサイズ: {self.image_buffer_size}\n")
+                    f.write(f"送信画像数: {self.images_per_request}\n")
+                    f.write(f"{'='*60}\n\n")
+                print(f"[Debug] 画像解析デバッグファイルを初期化: {self.debug_analysis_file}")
+            
+            # 要約デバッグファイル初期化
+            if self.debug_summary_file:
+                with open(self.debug_summary_file, 'w', encoding='utf-8') as f:
+                    f.write(f"要約生成デバッグログ\n")
+                    f.write(f"開始日時: {current_time}\n")
+                    f.write(f"要約モデル: {self.model_name}\n")
+                    f.write(f"要約トリガー: {self.max_logs}ログ蓄積時\n")
+                    f.write(f"{'='*60}\n\n")
+                print(f"[Debug] 要約デバッグファイルを初期化: {self.debug_summary_file}")
+            
+        except Exception as e:
+            print(f"デバッグファイル初期化エラー: {e}")
 
     def load_prompt(self):
         """
@@ -231,6 +304,75 @@ class OllamaVisionExplainer:
             except Exception as e:
                 print(f"音声認識停止エラー: {e}")
     
+    def start_screenshot_thread(self):
+        """
+        スクリーンショット取得スレッドを開始
+        """
+        if self.screenshot_thread is None or not self.screenshot_thread.is_alive():
+            self.screenshot_thread_running = True
+            self.screenshot_thread = threading.Thread(target=self._screenshot_worker)
+            self.screenshot_thread.daemon = True
+            self.screenshot_thread.start()
+            print("[Thread] スクリーンショット取得スレッドを開始しました")
+    
+    def stop_screenshot_thread(self):
+        """
+        スクリーンショット取得スレッドを停止
+        """
+        self.screenshot_thread_running = False
+        if self.screenshot_thread and self.screenshot_thread.is_alive():
+            print("[Stop] スクリーンショット取得スレッドを停止中...")
+            self.screenshot_thread.join(timeout=5)
+            print("[OK] スクリーンショット取得スレッドを停止しました")
+    
+    def _screenshot_worker(self):
+        """
+        スクリーンショット取得ワーカースレッド（1秒間隔で実行）
+        """
+        print("[Start] スクリーンショット取得ワーカーを開始しました")
+        
+        while self.screenshot_thread_running:
+            try:
+                # スクリーンショットを取得
+                screenshot = self.get_active_window_screenshot()
+                
+                if screenshot is not None:
+                    # 画像をリサイズしてbase64変換
+                    image_base64 = self.image_to_base64(screenshot)
+                    
+                    if image_base64 is not None:
+                        # タイムスタンプ付きで画像データを作成
+                        image_data = {
+                            'timestamp': time.time(),
+                            'base64': image_base64
+                        }
+                        
+                        # バッファサイズ制限チェック
+                        while self.image_buffer.qsize() >= self.image_buffer_size:
+                            try:
+                                # 最も古い画像を削除
+                                self.image_buffer.get_nowait()
+                                if self.debug_mode:
+                                    print("[Buffer] 古い画像を削除（バッファサイズ制限）")
+                            except queue.Empty:
+                                break
+                        
+                        # 新しい画像をバッファに追加
+                        self.image_buffer.put(image_data)
+                        
+                        if self.debug_mode:
+                            buffer_count = self.image_buffer.qsize()
+                            print(f"[Buffer] 画像を追加しました（バッファ: {buffer_count}/{self.image_buffer_size}）")
+                
+                # 2秒待機
+                time.sleep(2.0)
+                
+            except Exception as e:
+                print(f"スクリーンショット取得エラー: {e}")
+                time.sleep(2.0)  # エラー時も1秒待機
+        
+        print("[Stop] スクリーンショット取得ワーカーを終了しました")
+    
     def get_voice_context(self):
         """
         30秒以内かつ直近10個の音声認識結果を取得してフォーマット
@@ -283,8 +425,26 @@ class OllamaVisionExplainer:
             # ウィンドウの座標とサイズを取得
             left, top, width, height = active_window.left, active_window.top, active_window.width, active_window.height
             
+            # ウィンドウサイズの有効性をチェック
+            if width <= 0 or height <= 0:
+                if self.debug_mode:
+                    print(f"[スクリーンショットエラー] 無効なウィンドウサイズ: {width}x{height}")
+                return None
+            
+            # 最小サイズを保証
+            if width < 10 or height < 10:
+                if self.debug_mode:
+                    print(f"[スクリーンショット警告] ウィンドウサイズが小さすぎます: {width}x{height}")
+                return None
+            
             # スクリーンショットを取得（指定された領域のみ）
             screenshot = pyautogui.screenshot(region=(left, top, width, height))
+            
+            # 取得された画像の検証
+            if screenshot is None:
+                if self.debug_mode:
+                    print("[スクリーンショットエラー] pyautogui.screenshotがNoneを返しました")
+                return None
             
             return screenshot
             
@@ -303,11 +463,29 @@ class OllamaVisionExplainer:
             str: Base64エンコードされた画像データ
         """
         try:
+            # 画像の有効性をチェック
+            if image is None:
+                if self.debug_mode:
+                    print("[画像エラー] 画像がNoneです")
+                return None
+            
             # 元のサイズを記録
             original_size = image.size
             
+            # 画像サイズが有効かチェック
+            if original_size[0] <= 0 or original_size[1] <= 0:
+                if self.debug_mode:
+                    print(f"[画像エラー] 無効な画像サイズ: {original_size}")
+                return None
+            
             # 画像をリサイズ
             resized_image = self.resize_image(image.copy())
+            
+            # リサイズ後の画像サイズもチェック
+            if resized_image.size[0] <= 0 or resized_image.size[1] <= 0:
+                if self.debug_mode:
+                    print(f"[画像エラー] リサイズ後の無効なサイズ: {resized_image.size}")
+                return None
             
             # RGBAの場合はRGBに変換（JPEG保存のため）
             if resized_image.mode == 'RGBA':
@@ -374,27 +552,265 @@ class OllamaVisionExplainer:
             return f"{base_prompt}\n\n{self.prompt_content}"
         return base_prompt
     
-    def send_image_analysis_to_ollama(self, image_base64):
+    def load_previous_summary(self):
         """
-        画像の詳細説明のみを取得する（第1段階）
+        前回の要約ファイルを読み込む
+        
+        Returns:
+            str: 前回の要約内容（ファイルがない場合は空文字列）
+        """
+        try:
+            if os.path.exists(self.summary_file):
+                with open(self.summary_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                if self.debug_mode:
+                    print(f"[Summary] 前回の要約を読み込みました: {len(content)}文字")
+                return content
+            else:
+                if self.debug_mode:
+                    print("[Summary] 要約ファイルが存在しません（初回実行）")
+                return ""
+        except Exception as e:
+            print(f"要約ファイル読み込みエラー: {e}")
+            return ""
+    
+    def get_summary_context(self):
+        """
+        コメント生成用に要約情報を取得・フォーマット
+        
+        Returns:
+            str: コメント生成に使用する要約情報（ファイルがない場合は空文字列）
+        """
+        try:
+            if os.path.exists(self.summary_file):
+                with open(self.summary_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                
+                if content:
+                    # タイムスタンプ行を除去して要約本文のみを抽出
+                    lines = content.split('\n')
+                    summary_lines = []
+                    
+                    for line in lines:
+                        # タイムスタンプ行をスキップ
+                        if line.startswith('[更新日時:') and line.endswith(']'):
+                            continue
+                        summary_lines.append(line)
+                    
+                    summary_text = '\n'.join(summary_lines).strip()
+                    
+                    if summary_text:
+                        if self.debug_mode:
+                            print(f"[Summary] コメント生成に要約情報を使用: {len(summary_text)}文字")
+                        
+                        # コメント生成用にフォーマット
+                        formatted_summary = f"""これまでのゲーム進行状況:
+{summary_text}
+
+**重要**: 上記の要約情報も考慮して、現在の画面状況に応じた適切なコメントを生成してください。過去の流れを踏まえた発言や、進展に対する反応も含めることができます。"""
+                        
+                        return formatted_summary
+            
+            return ""
+            
+        except Exception as e:
+            if self.debug_mode:
+                print(f"要約コンテキスト取得エラー: {e}")
+            return ""
+    
+    def save_summary_to_file(self, summary_text):
+        """
+        要約をファイルに保存
         
         Args:
-            image_base64: Base64エンコードされた画像
+            summary_text: 要約テキスト
+        """
+        try:
+            # タイムスタンプ付きで保存
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            content = f"[更新日時: {timestamp}]\n{summary_text}"
             
+            with open(self.summary_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            print(f"[Summary] 要約をファイルに保存しました: {self.summary_file}")
+            if self.debug_mode:
+                print(f"[Summary] 保存内容: {len(summary_text)}文字")
+                
+        except Exception as e:
+            print(f"要約ファイル保存エラー: {e}")
+    
+    def generate_summary_request_to_ollama(self, analysis_logs):
+        """
+        蓄積された解説ログを要約するリクエストをOllamaに送信
+        
+        Args:
+            analysis_logs: 解説ログのリスト
+            
+        Returns:
+            str: 要約結果（エラーの場合はエラーメッセージ）
+        """
+        try:
+            # 前回の要約を読み込み
+            previous_summary = self.load_previous_summary()
+            
+            # プロンプトを構築
+            summary_prompt = """以下は、あるゲームのプレイ中にリアルタイムで記録された解説ログです。
+このログをもとに、これまでのストーリーやプレイの流れ・達成したこと・発生した重要イベントなどを簡潔にまとめてください。
+今までの要約がある場合は、それにも注意して、内容が重複しないようにしてください。
+
+目的：
+- 現在までのゲームプレイの全体像を把握するため
+- 新しく視聴する人にも内容が伝わるようにするため
+
+制約：
+- 500〜1000文字程度
+- 一般的な視聴者が理解しやすい言葉を使用
+- 登場人物や地名、イベント名はできるだけ明記
+- 単なる列挙ではなく、「流れ」としてまとめる
+
+今までの要約：
+"""
+            
+            if previous_summary:
+                summary_prompt += f"{previous_summary}\n\n"
+            else:
+                summary_prompt += "（これが最初の要約です）\n\n"
+            
+            summary_prompt += "今回のログ：\n"
+            
+            # ログを番号付きで追加
+            for i, log in enumerate(analysis_logs, 1):
+                summary_prompt += f"【ログ{i}】\n{log}\n\n"
+            
+            payload = {
+                "model": self.model_name,
+                "prompt": summary_prompt,
+                "images": [],  # 画像は送信しない
+                "stream": False
+            }
+            
+            if self.debug_mode:
+                print(f"[Summary] 要約リクエストを送信中... (ログ数: {len(analysis_logs)})")
+                print(f"[Summary] プロンプト長: {len(summary_prompt)}文字")
+            
+            headers = {
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.post(self.api_url, json=payload, headers=headers, timeout=120)
+            response.raise_for_status()
+            
+            result = response.json()
+            summary_text = result.get("response", "").strip()
+            
+            if self.debug_mode:
+                print(f"[Summary] 要約生成完了: {len(summary_text)}文字")
+                
+                # 要約専用デバッグファイルに詳細保存
+                if self.debug_summary_file:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.save_summary_debug_log(timestamp, len(analysis_logs), summary_text)
+            
+            return summary_text
+            
+        except requests.exceptions.ConnectionError:
+            return "エラー: Ollamaサーバーに接続できません。"
+        except requests.exceptions.Timeout:
+            return "エラー: 要約リクエストがタイムアウトしました。"
+        except requests.exceptions.RequestException as e:
+            return f"エラー: 要約API呼び出しに失敗しました: {e}"
+        except Exception as e:
+            return f"エラー: 要約生成中に予期しないエラーが発生しました: {e}"
+    
+    def process_analysis_log(self, analysis_text):
+        """
+        解説テキストを蓄積し、必要に応じて要約を実行
+        
+        Args:
+            analysis_text: 画像解析結果のテキスト
+            
+        Returns:
+            bool: 要約を実行した場合True
+        """
+        # ログを蓄積
+        self.analysis_logs.append(analysis_text)
+        
+        if self.debug_mode:
+            print(f"[Logs] 解説ログを蓄積: {len(self.analysis_logs)}/{self.max_logs}")
+        
+        # 上限に達した場合は要約を実行
+        if len(self.analysis_logs) >= self.max_logs:
+            print(f"📄 [Summary] ログが{self.max_logs}個に達しました。要約を生成します...")
+            
+            # 要約を生成
+            summary_result = self.generate_summary_request_to_ollama(self.analysis_logs)
+            
+            if not summary_result.startswith("エラー:"):
+                # 要約をファイルに保存
+                self.save_summary_to_file(summary_result)
+                print(f"📄 [Summary] 要約生成完了! ({len(summary_result)}文字)")
+                
+                # ログをクリア
+                self.analysis_logs = []
+                print(f"📄 [Logs] 解説ログをクリア - 新しいサイクルを開始")
+                
+                return True
+            else:
+                print(f"❌ [Summary] 要約生成エラー: {summary_result}")
+                return False
+        
+        return False
+
+    def send_image_analysis_to_ollama(self):
+        """
+        バッファから画像を取得して画像の詳細説明を取得する（第1段階）
+        
         Returns:
             str: 画像の詳細説明テキスト（エラーの場合はエラーメッセージ）
         """
         try:
-            # 画像解析専用のシンプルなプロンプト
-            analysis_prompt = """この画像を詳しく分析して説明してください。
+            # バッファから指定数の画像を取得
+            images_to_send = []
+            buffer_images = []
+            
+            # バッファから最新の画像を取得（時系列は逆順で格納されているため）
+            for _ in range(min(self.images_per_request, self.image_buffer.qsize())):
+                try:
+                    image_data = self.image_buffer.get_nowait()
+                    buffer_images.append(image_data)
+                except queue.Empty:
+                    break
+            
+            if not buffer_images:
+                return "エラー: 解析可能な画像がバッファにありません。"
+            
+            # 時系列順（古い順）にソートして送信用リストに変換
+            buffer_images.sort(key=lambda x: x['timestamp'])
+            images_to_send = [img['base64'] for img in buffer_images]
+            
+            if self.debug_mode:
+                timestamps = [datetime.fromtimestamp(img['timestamp']).strftime("%H:%M:%S") for img in buffer_images]
+                print(f"[Buffer] 解析用画像を取得: {len(images_to_send)}枚 (時系列: {' → '.join(timestamps)})")
+            
+            # 複数画像に対応したプロンプト
+            if len(images_to_send) > 1:
+                analysis_prompt = f"""提供された動画を分析して説明してください。
+
+動画中で見えるものを詳細に説明し、変化や動きがあれば特に注目してください。
+客観的かつ詳細に、実際に画面に表示されている内容を正確に記述してください。
+2000字以内で記述してください。"""
+            else:
+                analysis_prompt = """この画像を詳しく分析して説明してください。
 
 客観的かつ詳細に、見えるものをそのまま説明してください。
-推測や解釈ではなく、実際に画面に表示されている内容を正確に記述してください。"""
+推測や解釈ではなく、実際に画面に表示されている内容を正確に記述してください。
+2000字以内で記述してください。"""
 
             payload = {
                 "model": self.model_name,
                 "prompt": analysis_prompt,
-                "images": [image_base64],
+                "images": images_to_send,
                 "stream": False
             }
             
@@ -410,12 +826,16 @@ class OllamaVisionExplainer:
             
             if self.debug_mode:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[DEBUG][画像解析] [{timestamp}] {analysis_text}")
+                print(f"[DEBUG][画像解析] [{timestamp}] ({len(images_to_send)}枚の画像) {analysis_text}")
                 
-                # ログファイルに保存
+                # 従来のログファイルに保存
                 if self.debug_log_file:
                     with open(self.debug_log_file, 'a', encoding='utf-8') as f:
-                        f.write(f"[{timestamp}][画像解析] {analysis_text}\n")
+                        f.write(f"[{timestamp}][画像解析][{len(images_to_send)}枚] {analysis_text}\n")
+                
+                # 画像解析専用デバッグファイルに詳細保存
+                if self.debug_analysis_file:
+                    self.save_analysis_debug_log(timestamp, len(images_to_send), analysis_text)
             
             return analysis_text.strip()
             
@@ -461,9 +881,12 @@ class OllamaVisionExplainer:
                     )
                     selected_personas.extend(random_personas)
                 
-                # 人格用プロンプトを生成
+                # 要約情報を取得（存在する場合）
+                summary_context = self.get_summary_context()
+                
+                # 人格用プロンプトを生成（要約情報も含める）
                 enhanced_prompt = self.persona_manager.create_prompt_for_personas(
-                    selected_personas, voice_context, self.prompt_file
+                    selected_personas, voice_context, self.prompt_file, summary_context
                 )
                 
                 # 画像解析結果を組み込み
@@ -499,6 +922,8 @@ class OllamaVisionExplainer:
             # デバッグ出力を追加
             if self.debug_mode:
                 print(f"[DEBUG] コメント生成モデル: {self.comment_model_name}")
+                if summary_context:
+                    print(f"[DEBUG] 要約情報を含むコメント生成を実行")
                 print(f"[DEBUG] 送信するプロンプト (最初の800文字):\n{enhanced_prompt[:800]}...")
                 print(f"[DEBUG] プロンプト全体の文字数: {len(enhanced_prompt)}")
             
@@ -630,8 +1055,47 @@ class OllamaVisionExplainer:
         except Exception as e:
             print(f"デバッグ出力処理エラー: {e}")
     
-
+    def save_analysis_debug_log(self, timestamp, image_count, analysis_text):
+        """
+        画像解析結果をデバッグファイルに詳細保存
+        
+        Args:
+            timestamp: タイムスタンプ文字列
+            image_count: 解析した画像枚数
+            analysis_text: 解析結果テキスト
+        """
+        try:
+            with open(self.debug_analysis_file, 'a', encoding='utf-8') as f:
+                f.write(f"{'='*60}\n")
+                f.write(f"日時: {timestamp}\n")
+                f.write(f"送信画像数: {image_count}枚\n")
+                f.write(f"モデル: {self.model_name}\n")
+                f.write(f"解析結果:\n{analysis_text}\n")
+                f.write(f"{'='*60}\n\n")
+                
+        except Exception as e:
+            print(f"画像解析デバッグログ保存エラー: {e}")
     
+    def save_summary_debug_log(self, timestamp, log_count, summary_text):
+        """
+        要約結果をデバッグファイルに詳細保存
+        
+        Args:
+            timestamp: タイムスタンプ文字列
+            log_count: 蓄積ログ数
+            summary_text: 要約結果テキスト
+        """
+        try:
+            with open(self.debug_summary_file, 'a', encoding='utf-8') as f:
+                f.write(f"{'='*60}\n")
+                f.write(f"日時: {timestamp}\n")
+                f.write(f"蓄積ログ数: {log_count}個\n")
+                f.write(f"要約モデル: {self.model_name}\n")
+                f.write(f"要約結果:\n{summary_text}\n")
+                f.write(f"{'='*60}\n\n")
+                
+        except Exception as e:
+            print(f"要約デバッグログ保存エラー: {e}")
 
     
     def write_to_xml_log(self, response_data):
@@ -911,12 +1375,21 @@ class OllamaVisionExplainer:
         print(f"Ollama Vision Explainer を開始しました")
         print(f"画像解析モデル: {self.model_name}")
         print(f"コメント生成モデル: {self.comment_model_name}")
-        print(f"実行間隔: {interval}秒")
+        print(f"解析間隔: {interval}秒")
+        print(f"画像バッファサイズ: {self.image_buffer_size}")
+        print(f"送信画像数: {self.images_per_request}")
+        print(f"要約機能: {self.max_logs}個のログで自動要約")
+        print(f"要約ファイル: {self.summary_file}")
         print(f"Ollama URL: {self.ollama_url}")
         print(f"音声認識: {'有効' if self.enable_voice else '無効'}")
         print(f"デバッグモード: {'有効' if self.debug_mode else '無効'}")
-        if self.debug_mode and self.debug_log_file:
-            print(f"デバッグログ: {self.debug_log_file}")
+        if self.debug_mode:
+            if self.debug_log_file:
+                print(f"デバッグログ: {self.debug_log_file}")
+            if self.debug_analysis_file:
+                print(f"画像解析ログ: {self.debug_analysis_file}")
+            if self.debug_summary_file:
+                print(f"要約ログ: {self.debug_summary_file}")
         print("-" * 50)
         print("Ctrl+C で停止できます\n")
         
@@ -927,31 +1400,33 @@ class OllamaVisionExplainer:
         # XML出力スレッドを開始
         self.start_xml_output_thread()
         
+        # スクリーンショット取得スレッドを開始
+        self.start_screenshot_thread()
+        
         while True:
             try:
                 # 現在時刻を表示
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{current_time}] スクリーンショット解析を実行中...")
+                print(f"[{current_time}] 画像バッファ解析を実行中...")
                 
-                # スクリーンショットを取得
-                screenshot = self.get_active_window_screenshot()
-                
-                if screenshot is None:
-                    print("スクリーンショットが取得できませんでした")
-                    time.sleep(interval)
+                # バッファに十分な画像があるかチェック
+                buffer_size = self.image_buffer.qsize()
+                if buffer_size < self.images_per_request:
+                    # 不足している画像数分だけ待機（1秒間隔でスクリーンショット取得されるため）
+                    shortage = self.images_per_request - buffer_size
+                    wait_time = shortage * 1.0  # 不足数 × 1秒
+                    
+                    if buffer_size == 0:
+                        print(f"  画像バッファが空です。{self.images_per_request}枚必要 - {wait_time:.0f}秒待機")
+                    else:
+                        print(f"  画像バッファ不足: {buffer_size}/{self.images_per_request} 枚 - {wait_time:.0f}秒待機")
+                    
+                    time.sleep(wait_time)
                     continue
                 
-                # 画像をBase64に変換
-                image_base64 = self.image_to_base64(screenshot)
-                
-                if image_base64 is None:
-                    print("画像のエンコードに失敗しました")
-                    time.sleep(interval)
-                    continue
-                
-                # 【第1段階】画像の詳細解析
-                print("  [段階1] 画像の詳細解析を実行中...")
-                image_analysis = self.send_image_analysis_to_ollama(image_base64)
+                # 【第1段階】バッファから画像を取得して詳細解析
+                print(f"  [段階1] バッファから{self.images_per_request}枚の画像解析を実行中...")
+                image_analysis = self.send_image_analysis_to_ollama()
                 
                 if image_analysis.startswith("エラー:"):
                     print(f"画像解析エラー: {image_analysis}")
@@ -960,10 +1435,17 @@ class OllamaVisionExplainer:
                 
                 print(f"  [段階1] 完了: 画像解析結果を取得しました")
                 
-                # 【第2段階】音声コンテキストを取得してコメント生成
+                # 解説を蓄積し、必要に応じて要約を実行
+                print(f"  [ログ蓄積] 解説を蓄積中: {len(self.analysis_logs) + 1}/{self.max_logs}")
+                summary_generated = self.process_analysis_log(image_analysis)
+                
+                # 要約生成の有無に関わらず、コメント生成も実行
                 print("  [段階2] コメント生成を実行中...")
                 voice_context = self.get_voice_context()
                 response = self.send_comment_generation_to_ollama(image_analysis, voice_context)
+                
+                if summary_generated:
+                    print("  📄 要約も並行して生成されました")
                 
                 # 結果を表示
                 print(f"[Screenshot] 最終結果:")
@@ -1020,9 +1502,10 @@ class OllamaVisionExplainer:
                 print(f"予期しないエラー: {e}")
                 time.sleep(interval)
         
-        # 終了処理: 音声認識とXML出力スレッドを停止
+        # 終了処理: すべてのスレッドを停止
         if self.enable_voice:
             self.stop_voice_recognition()
+        self.stop_screenshot_thread()
         self.stop_xml_output_thread()
 
 
@@ -1034,6 +1517,13 @@ def main():
     import argparse
     
     try:
+        print("Ollama Vision Explainer を起動しています...30秒待機します。その間にゲーム画面を起動してください")
+        time.sleep(10.0)
+        print("残り20秒...")
+        time.sleep(10.0)
+        print("残り10秒...")
+        time.sleep(10.0)
+        print("起動します")
         # コマンドライン引数の解析
         parser = argparse.ArgumentParser(description="リアルタイム画面解析・コメント生成システム")
         
@@ -1091,7 +1581,10 @@ def main():
             compression_ratio=config.performance.image.compression_ratio,
             jpeg_quality=config.performance.image.jpeg_quality,
             voice_server_url=config.environment.voice_server_url,
-            persona_config=config.personas
+            persona_config=config.personas,
+            image_buffer_size=config.performance.image.buffer_size,
+            images_per_request=config.performance.image.images_per_request,
+            max_logs=config.system.max_logs
         )
         
         if config.behavior.debug_mode:
